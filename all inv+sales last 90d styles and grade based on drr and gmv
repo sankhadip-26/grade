@@ -1,0 +1,573 @@
+
+WITH date_range AS (
+  SELECT
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 90 DAY) AS start_date,
+    DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 1 DAY) AS end_date
+),
+
+-- =========================================================
+-- PART 1: IN-STOCK DRR - ORIGINAL LOGIC
+-- =========================================================
+
+sku_in_stock_days AS (
+  SELECT
+    sku,
+    company_code,
+    create_date,
+    store_code,
+    SUM(quantity) AS qty
+  FROM `slikk-prod.slikkprodpublic.product_inventorysnapshot`
+  CROSS JOIN date_range d
+  WHERE
+    create_date >= d.start_date
+    AND create_date <= d.end_date
+  GROUP BY 1, 2, 3, 4
+),
+
+drr_sales AS (
+  SELECT
+    pp.sku AS sku,
+    sc.code AS company_code,
+    DATE(oo.create_date + INTERVAL 330 MINUTE) AS order_date,
+    LOWER(ss.code) AS store_code,
+    SUM(oi.quantity) AS qty_ordered
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+  JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+  JOIN `slikk-prod.slikkprodpublic.store_store` ss
+    ON ss.id = oo.store_id
+  CROSS JOIN date_range d
+  WHERE
+    oo.delivery_type != 'EXCHANGE'
+    AND oo.status NOT IN ('OPEN', 'FAILED')
+    AND DATE(oo.create_date + INTERVAL 330 MINUTE)
+      BETWEEN d.start_date AND d.end_date
+  GROUP BY 1, 2, 3, 4
+),
+
+sku_store_days AS (
+  SELECT
+    COALESCE(s.sku, i.sku) AS sku,
+    COALESCE(s.company_code, i.company_code) AS company_code,
+    COALESCE(s.order_date, i.create_date) AS day,
+    COALESCE(i.qty, 0) AS inv_qty,
+    COALESCE(s.qty_ordered, 0) AS sold_qty,
+    COALESCE(s.store_code, i.store_code) AS store_code
+  FROM drr_sales s
+  FULL OUTER JOIN sku_in_stock_days i
+    ON s.sku = i.sku
+    AND LOWER(s.company_code) = LOWER(i.company_code)
+    AND s.order_date = i.create_date
+    AND s.store_code = i.store_code
+),
+
+store_day_flagged AS (
+  SELECT
+    sku,
+    company_code,
+    store_code,
+    day,
+    inv_qty,
+    sold_qty,
+    CASE
+      WHEN inv_qty > 0 OR sold_qty > 0 THEN 1
+      ELSE 0
+    END AS active_day_flag
+  FROM sku_store_days
+),
+
+sku_day AS (
+  SELECT
+    sku,
+    company_code,
+    day,
+    SUM(sold_qty) AS sold_qty,
+    MAX(active_day_flag) AS active_day_flag
+  FROM store_day_flagged
+  GROUP BY 1, 2, 3
+),
+
+sku_drr AS (
+  SELECT
+    sku,
+    company_code,
+
+    SUM(
+      IF(day >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 30 DAY),
+        sold_qty, 0)
+    ) AS qty_30d,
+
+    SUM(
+      IF(day >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 30 DAY),
+        active_day_flag, 0)
+    ) AS active_days_30d,
+
+    SUM(
+      IF(day >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 60 DAY),
+        sold_qty, 0)
+    ) AS qty_60d,
+
+    SUM(
+      IF(day >= DATE_SUB(CURRENT_DATE('Asia/Kolkata'), INTERVAL 60 DAY),
+        active_day_flag, 0)
+    ) AS active_days_60d,
+
+    SUM(sold_qty) AS qty_90d,
+    SUM(active_day_flag) AS active_days_90d
+
+  FROM sku_day
+  GROUP BY 1, 2
+),
+
+sku_drr_final AS (
+  SELECT
+    sku,
+    company_code,
+
+    ROUND(
+      SAFE_DIVIDE(qty_30d, active_days_30d)
+      * IF(active_days_30d <= 3, 0.5, 1),
+      2
+    ) AS drr_30d,
+
+    ROUND(
+      SAFE_DIVIDE(qty_60d, active_days_60d)
+      * IF(active_days_60d <= 3, 0.5, 1),
+      2
+    ) AS drr_60d,
+
+    ROUND(
+      SAFE_DIVIDE(qty_90d, active_days_90d)
+      * IF(active_days_90d <= 3, 0.5, 1),
+      2
+    ) AS drr_90d
+
+  FROM sku_drr
+),
+
+-- =========================================================
+-- PART 2: SALES - INCLUDING REALIZED GMV
+-- =========================================================
+
+sales_base AS (
+  SELECT
+    UPPER(TRIM(nt.division)) AS division,
+    COALESCE(pb.name, 'NA') AS brand,
+    nt.gender AS gender,
+
+    pp.sku AS sku,
+    pp.variant_id AS style_code,
+    sc.code AS company_code,
+
+    SAFE_CAST(oi.quantity AS NUMERIC) AS quantity,
+    SAFE_CAST(oi.sp AS NUMERIC) AS sp,
+
+    SAFE_CAST(oi.sp AS NUMERIC)
+      * SAFE_CAST(oi.quantity AS NUMERIC) AS gmv
+
+  FROM `slikk-prod.slikkprodpublic.order_order` oo
+
+  JOIN `slikk-prod.slikkprodpublic.order_orderitem` oi
+    ON oo.id = oi.order_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = oi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  LEFT JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON sc.id = pp.company_id
+
+  CROSS JOIN date_range d
+
+  WHERE
+    oo.status NOT IN ('OPEN', 'FAILED')
+    AND oo.delivery_type != 'EXCHANGE'
+    AND DATE(oo.create_date, 'Asia/Kolkata')
+      BETWEEN d.start_date AND d.end_date
+),
+
+sales_sku AS (
+  SELECT
+    division,
+    gender,
+    brand,
+    style_code,
+    sku,
+    company_code,
+
+    SUM(quantity) AS sales_qty_90d,
+    SUM(gmv) AS sales_gmv_90d
+
+  FROM sales_base
+  GROUP BY
+    division,
+    gender,
+    brand,
+    style_code,
+    sku,
+    company_code
+),
+
+-- =========================================================
+-- PART 3: JOIN SKU SALES WITH SKU DRR
+-- =========================================================
+
+sku_combined AS (
+  SELECT
+    s.division,
+    s.gender,
+    s.brand,
+    s.style_code,
+    s.sku,
+    s.company_code,
+
+    s.sales_qty_90d,
+    s.sales_gmv_90d,
+
+    COALESCE(d.drr_30d, 0) AS drr_30d,
+    COALESCE(d.drr_60d, 0) AS drr_60d,
+    COALESCE(d.drr_90d, 0) AS drr_90d
+
+  FROM sales_sku s
+  LEFT JOIN sku_drr_final d
+    ON s.sku = d.sku
+    AND LOWER(s.company_code) = LOWER(d.company_code)
+),
+
+-- =========================================================
+-- PART 4: SALES STYLE-LEVEL AGGREGATION
+-- =========================================================
+
+style_level AS (
+  SELECT
+    UPPER(TRIM(division)) AS division,
+    gender,
+    brand,
+    style_code,
+
+    SUM(sales_qty_90d) AS sales_qty_90d,
+    ROUND(SUM(sales_gmv_90d), 2) AS sales_gmv_90d,
+
+    ROUND(SUM(drr_30d), 2) AS total_drr_30d,
+    ROUND(SUM(drr_60d), 2) AS total_drr_60d,
+    ROUND(SUM(drr_90d), 2) AS total_drr_90d
+
+  FROM sku_combined
+  GROUP BY
+    division,
+    gender,
+    brand,
+    style_code
+),
+
+-- =========================================================
+-- PART 5: INVENTORY STYLE POPULATION
+-- =========================================================
+
+inventory_styles AS (
+  SELECT DISTINCT
+    UPPER(TRIM(nt.division)) AS division,
+    COALESCE(pb.name, 'NA') AS brand,
+    nt.gender AS gender,
+    pp.variant_id AS style_code
+
+  FROM `slikk-prod.slikkprodpublic.product_inventory` pi
+
+  JOIN `slikk-prod.slikkprodpublic.store_store` ss
+    ON pi.store_id = ss.id
+
+  JOIN `slikk-prod.slikkprodpublic.product_product` pp
+    ON pp.id = pi.product_id
+
+  JOIN `slikk-prod.slikkprodpublic.store_company` sc
+    ON pp.company_id = sc.id
+
+  JOIN `slikk-prod.slikkprodpublic.product_brand` pb
+    ON pb.id = pp.brand_id
+
+  JOIN `slikk-prod.slikksilver.product_tags` pt
+    ON pt.product_id = pi.product_id
+
+  LEFT JOIN `slikk-prod.slikkanalytics.silver_new_product_tags` nt
+    ON nt.product_id = pp.id
+
+  WHERE
+    pp.variant_id IS NOT NULL
+),
+
+-- =========================================================
+-- PART 6: COMBINE SALES + INVENTORY STYLE POPULATION
+-- =========================================================
+
+style_level_combined AS (
+
+  SELECT
+    UPPER(TRIM(division)) AS division,
+    gender,
+    brand,
+    style_code,
+
+    sales_qty_90d,
+    sales_gmv_90d,
+
+    total_drr_30d,
+    total_drr_60d,
+    total_drr_90d
+
+  FROM style_level
+
+  UNION ALL
+
+  SELECT
+    UPPER(TRIM(i.division)) AS division,
+    i.gender,
+    i.brand,
+    i.style_code,
+
+    0 AS sales_qty_90d,
+    0 AS sales_gmv_90d,
+
+    0 AS total_drr_30d,
+    0 AS total_drr_60d,
+    0 AS total_drr_90d
+
+  FROM inventory_styles i
+
+  LEFT JOIN style_level s
+    ON UPPER(TRIM(s.division)) = UPPER(TRIM(i.division))
+    AND s.gender = i.gender
+    AND s.brand = i.brand
+    AND s.style_code = i.style_code
+
+  WHERE s.style_code IS NULL
+),
+
+-- =========================================================
+-- PART 7: DRR AND GMV BASE
+-- =========================================================
+
+grading_base AS (
+  SELECT
+    *,
+
+    GREATEST(
+      total_drr_30d,
+      total_drr_60d,
+      total_drr_90d
+    ) AS grading_drr,
+
+    COALESCE(sales_gmv_90d, 0) AS grading_gmv
+
+  FROM style_level_combined
+),
+
+-- =========================================================
+-- PART 8: FOUR CUMULATIVE CONTRIBUTIONS
+-- =========================================================
+
+grading_running AS (
+  SELECT
+    *,
+
+    -- DRR: Division-wise contribution
+    SAFE_DIVIDE(
+      SUM(grading_drr) OVER (
+        PARTITION BY division
+        ORDER BY
+          grading_drr DESC,
+          gender,
+          brand,
+          style_code
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      SUM(grading_drr) OVER (
+        PARTITION BY division
+      )
+    ) AS division_drr_cumulative_contribution,
+
+    -- DRR: Overall contribution
+    SAFE_DIVIDE(
+      SUM(grading_drr) OVER (
+        ORDER BY
+          grading_drr DESC,
+          division,
+          gender,
+          brand,
+          style_code
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      SUM(grading_drr) OVER ()
+    ) AS overall_drr_cumulative_contribution,
+
+    -- GMV: Division-wise contribution
+    SAFE_DIVIDE(
+      SUM(grading_gmv) OVER (
+        PARTITION BY division
+        ORDER BY
+          grading_gmv DESC,
+          gender,
+          brand,
+          style_code
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      SUM(grading_gmv) OVER (
+        PARTITION BY division
+      )
+    ) AS division_gmv_cumulative_contribution,
+
+    -- GMV: Overall contribution
+    SAFE_DIVIDE(
+      SUM(grading_gmv) OVER (
+        ORDER BY
+          grading_gmv DESC,
+          division,
+          gender,
+          brand,
+          style_code
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      ),
+      SUM(grading_gmv) OVER ()
+    ) AS overall_gmv_cumulative_contribution
+
+  FROM grading_base
+),
+
+-- =========================================================
+-- PART 9: FOUR GRADE ASSIGNMENTS
+-- =========================================================
+
+grade_output AS (
+  SELECT
+    *,
+
+    -- DRR DIVISION GRADE
+    CASE
+      WHEN COALESCE(division_drr_cumulative_contribution, 0) <= 0.20 THEN 'A'
+      WHEN division_drr_cumulative_contribution <= 0.40 THEN 'B'
+      WHEN division_drr_cumulative_contribution <= 0.60 THEN 'C'
+      WHEN division_drr_cumulative_contribution <= 0.80 THEN 'D'
+      ELSE 'E'
+    END AS division_drr_grade,
+
+    -- DRR OVERALL GRADE
+    CASE
+      WHEN COALESCE(overall_drr_cumulative_contribution, 0) <= 0.20 THEN 'A'
+      WHEN overall_drr_cumulative_contribution <= 0.40 THEN 'B'
+      WHEN overall_drr_cumulative_contribution <= 0.60 THEN 'C'
+      WHEN overall_drr_cumulative_contribution <= 0.80 THEN 'D'
+      ELSE 'E'
+    END AS overall_drr_grade,
+
+    -- GMV DIVISION GRADE
+    CASE
+      WHEN COALESCE(division_gmv_cumulative_contribution, 0) <= 0.20 THEN 'A'
+      WHEN division_gmv_cumulative_contribution <= 0.40 THEN 'B'
+      WHEN division_gmv_cumulative_contribution <= 0.60 THEN 'C'
+      WHEN division_gmv_cumulative_contribution <= 0.80 THEN 'D'
+      ELSE 'E'
+    END AS division_gmv_grade,
+
+    -- GMV OVERALL GRADE
+    CASE
+      WHEN COALESCE(overall_gmv_cumulative_contribution, 0) <= 0.20 THEN 'A'
+      WHEN overall_gmv_cumulative_contribution <= 0.40 THEN 'B'
+      WHEN overall_gmv_cumulative_contribution <= 0.60 THEN 'C'
+      WHEN overall_gmv_cumulative_contribution <= 0.80 THEN 'D'
+      ELSE 'E'
+    END AS overall_gmv_grade
+
+  FROM grading_running
+),
+
+-- =========================================================
+-- PART 10: FINAL GRADE = BEST OF ALL FOUR GRADES
+-- =========================================================
+
+final_output AS (
+  SELECT
+    *,
+
+    CASE
+      WHEN division IS NULL THEN
+        LEAST(
+          overall_drr_grade,
+          overall_gmv_grade
+        )
+      ELSE
+        LEAST(
+          division_drr_grade,
+          overall_drr_grade,
+          division_gmv_grade,
+          overall_gmv_grade
+        )
+    END AS final_grade
+
+  FROM grade_output
+)
+
+-- =========================================================
+-- FINAL OUTPUT
+-- =========================================================
+
+SELECT
+  division,
+  gender,
+  brand,
+  style_code,
+
+  sales_qty_90d,
+  ROUND(sales_gmv_90d, 2) AS sales_gmv_90d,
+
+  total_drr_30d,
+  total_drr_60d,
+  total_drr_90d,
+
+  grading_drr,
+  grading_gmv,
+
+  ROUND(
+    division_drr_cumulative_contribution * 100, 2
+  ) AS division_drr_contribution_percent,
+
+  division_drr_grade,
+
+  ROUND(
+    overall_drr_cumulative_contribution * 100, 2
+  ) AS overall_drr_contribution_percent,
+
+  overall_drr_grade,
+
+  ROUND(
+    division_gmv_cumulative_contribution * 100, 2
+  ) AS division_gmv_contribution_percent,
+
+  division_gmv_grade,
+
+  ROUND(
+    overall_gmv_cumulative_contribution * 100, 2
+  ) AS overall_gmv_contribution_percent,
+
+  overall_gmv_grade,
+
+  final_grade
+
+FROM final_output
+
+ORDER BY
+  division,
+  grading_drr DESC,
+  gender,
+  brand,
+  style_code;
